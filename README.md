@@ -13,8 +13,16 @@ staging safe cleanup decisions before changing anything on disk.
   first; after every folder has been covered, the next scan starts a fresh cycle.
 - Starts hashing while folder discovery is still running, then transitions from
   indeterminate progress to percentage and remaining-folder progress.
+- Builds review snapshots and image thumbnails off the GUI thread, coalescing
+  live scan updates so the window remains movable and resizable during scans.
 - Shows compact, collapsed duplicate groups while the background scan is still
   running. One shared thumbnail represents the identical content.
+- Organizes results into collapsed nested folder groups using the deepest
+  directory shared by each duplicate set's copy locations.
+- Keeps expanded folder/result nodes stable while live scan snapshots arrive,
+  preserving the browsing position instead of collapsing the tree.
+- Provides folder-node actions to stage every descendant's safe recommendation
+  or ignore all duplicate results under that node.
 - Highlights differing path components, suppresses identical timestamp noise,
   and provides subtle hover actions to open a file or reveal it in Explorer.
 - Rolls proven identical or subset folder trees into one destination-folder
@@ -28,6 +36,8 @@ staging safe cleanup decisions before changing anything on disk.
 - Sends removed copies to the Windows Recycle Bin.
 - Records commits in History and can reconstruct removed exact duplicates at
   their original paths and timestamps when Undo preflight checks remain safe.
+- Shows continuously updated elapsed scan time and a smoothed ETA once the scan
+  scope and processing rate are known.
 
 ## Run from source
 
@@ -59,6 +69,10 @@ one failed group does not stop the remaining groups.
 Ignored groups return to the inbox if their copy membership changes. Staged
 groups whose membership changes are marked stale and cannot be committed until
 they are reviewed again.
+
+**Clear scan results** removes the selected root's current Duplicates cache,
+folder progress, and Cart while preserving Ignored decisions and History. The
+Ignored tab has a separate **Clear ignored** action.
 
 Undo recreates files from the retained exact duplicate. It is intentionally
 blocked if the retained file changed or an original destination path has become

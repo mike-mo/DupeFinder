@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS scan_roots (
     path TEXT PRIMARY KEY,
     min_size_bytes INTEGER NOT NULL,
+    results_valid INTEGER NOT NULL DEFAULT 0,
     cycle_started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -176,7 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_commit_items_batch
     ON commit_items(commit_batch_id);
 """
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def normalize_path(path: str | Path) -> str:
@@ -314,6 +315,16 @@ class Database:
                     """
                 )
 
+        if version < 4:
+            scan_root_columns = self._column_names(connection, "scan_roots")
+            if "results_valid" not in scan_root_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE scan_roots
+                    ADD COLUMN results_valid INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_actions_batch ON pending_actions(batch_id)"
         )
@@ -365,6 +376,27 @@ class Database:
                     (root,),
                 )
         return root
+
+    def scan_results_valid(self, root_path: str | Path) -> bool:
+        root = normalize_path(root_path)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT results_valid FROM scan_roots WHERE path = ?",
+                (root,),
+            ).fetchone()
+        return bool(row and row["results_valid"])
+
+    def mark_scan_results_valid(
+        self,
+        root_path: str | Path,
+        valid: bool,
+    ) -> None:
+        root = normalize_path(root_path)
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE scan_roots SET results_valid = ? WHERE path = ?",
+                (int(valid), root),
+            )
 
     def register_folders(self, root_path: str, folder_paths: Sequence[str]) -> None:
         folders = [(root_path, normalize_path(path)) for path in folder_paths]
@@ -451,6 +483,46 @@ class Database:
                 SET status = 'pending', completed_at = NULL, last_error = NULL
                 WHERE root_path = ?
                 """,
+                (root,),
+            )
+
+    def clear_scan_results(self, root_path: str | Path) -> None:
+        root = normalize_path(root_path)
+        with self.transaction() as connection:
+            batch_rows = connection.execute(
+                """
+                SELECT id FROM action_batches
+                WHERE root_path = ? AND status IN ('pending', 'stale', 'error')
+                """,
+                (root,),
+            ).fetchall()
+            batch_ids = [row["id"] for row in batch_rows]
+            if batch_ids:
+                placeholders = ",".join("?" for _ in batch_ids)
+                connection.execute(
+                    f"DELETE FROM pending_actions WHERE batch_id IN ({placeholders})",
+                    batch_ids,
+                )
+                connection.execute(
+                    f"DELETE FROM action_batches WHERE id IN ({placeholders})",
+                    batch_ids,
+                )
+            connection.execute("DELETE FROM files WHERE root_path = ?", (root,))
+            connection.execute("DELETE FROM folders WHERE root_path = ?", (root,))
+            connection.execute(
+                """
+                UPDATE scan_roots
+                SET cycle_started_at = CURRENT_TIMESTAMP, results_valid = 0
+                WHERE path = ?
+                """,
+                (root,),
+            )
+
+    def clear_ignored(self, root_path: str | Path) -> None:
+        root = normalize_path(root_path)
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM ignored_review_items WHERE root_path = ?",
                 (root,),
             )
 
@@ -1007,6 +1079,64 @@ class Database:
                 (review_key,),
             )
 
+    def migrate_review_fingerprint(
+        self,
+        review_key: str,
+        legacy_fingerprint: str,
+        current_fingerprint: str,
+    ) -> None:
+        if legacy_fingerprint == current_fingerprint:
+            return
+        with self._connect() as connection:
+            match = connection.execute(
+                """
+                SELECT 1 FROM ignored_review_items
+                WHERE review_key = ? AND fingerprint = ?
+                UNION ALL
+                SELECT 1 FROM action_batches
+                WHERE review_key = ? AND review_fingerprint = ?
+                UNION ALL
+                SELECT 1 FROM pending_actions
+                WHERE review_key = ? AND review_fingerprint = ?
+                LIMIT 1
+                """,
+                (
+                    review_key,
+                    legacy_fingerprint,
+                    review_key,
+                    legacy_fingerprint,
+                    review_key,
+                    legacy_fingerprint,
+                ),
+            ).fetchone()
+        if not match:
+            return
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                UPDATE ignored_review_items
+                SET fingerprint = ?
+                WHERE review_key = ? AND fingerprint = ?
+                """,
+                (current_fingerprint, review_key, legacy_fingerprint),
+            )
+            connection.execute(
+                """
+                UPDATE action_batches
+                SET review_fingerprint = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE review_key = ? AND review_fingerprint = ?
+                """,
+                (current_fingerprint, review_key, legacy_fingerprint),
+            )
+            connection.execute(
+                """
+                UPDATE pending_actions
+                SET review_fingerprint = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE review_key = ? AND review_fingerprint = ?
+                """,
+                (current_fingerprint, review_key, legacy_fingerprint),
+            )
+
     def ignored_review_keys(self, root_path: str | Path) -> dict[str, str]:
         root = normalize_path(root_path)
         with self._connect() as connection:
@@ -1019,6 +1149,19 @@ class Database:
                 (root,),
             ).fetchall()
         return {row["review_key"]: row["fingerprint"] for row in rows}
+
+    def ignored_review_count(self, root_path: str | Path) -> int:
+        root = normalize_path(root_path)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM ignored_review_items
+                WHERE root_path = ?
+                """,
+                (root,),
+            ).fetchone()
+        return int(row["count"])
 
     def reconcile_review_items(self, root_path: str | Path, fingerprints: dict[str, str]) -> None:
         root = normalize_path(root_path)
@@ -1480,6 +1623,12 @@ class Database:
 
     @staticmethod
     def _cleanup_groups(connection: sqlite3.Connection, root_path: str) -> None:
+        validity = connection.execute(
+            "SELECT results_valid FROM scan_roots WHERE path = ?",
+            (root_path,),
+        ).fetchone()
+        if validity and not validity["results_valid"]:
+            return
         connection.execute(
             """
             DELETE FROM duplicate_groups
@@ -1495,6 +1644,11 @@ class Database:
             """,
             (root_path, root_path),
         )
+
+    def cleanup_duplicate_groups(self, root_path: str | Path) -> None:
+        root = normalize_path(root_path)
+        with self.transaction() as connection:
+            self._cleanup_groups(connection, root)
 
     @staticmethod
     def _file_from_row(row: sqlite3.Row) -> FileRecord:

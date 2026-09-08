@@ -41,6 +41,7 @@ class ScannerEngine:
         self.on_status = on_status or (lambda _message: None)
         self.should_stop = should_stop or (lambda: False)
         self._candidate_recheck_incomplete = False
+        self._scan_had_errors = False
 
     def run(self) -> ScanResult:
         root = Path(self.root_path)
@@ -50,6 +51,7 @@ class ScannerEngine:
             raise ValueError("Minimum file size cannot be negative")
 
         self.database.prepare_root(root, self.min_size_bytes)
+        self.database.mark_scan_results_valid(self.root_path, False)
         self.on_status("Discovering folders and scanning new areas...")
         folder_queue: queue.Queue[str | None] = queue.Queue()
         discovery_done = threading.Event()
@@ -152,6 +154,13 @@ class ScannerEngine:
                 self.on_progress(completed, total, True, folder)
 
         self.on_progress(completed, scheduled or len(discovered), True, "")
+        if self._scan_had_errors:
+            raise OSError(
+                "Scan incomplete because one or more folders or files could not "
+                "be inspected. Cached results were preserved where possible."
+            )
+        self.database.mark_scan_results_valid(self.root_path, True)
+        self.database.cleanup_duplicate_groups(self.root_path)
         return ScanResult(
             False,
             completed,
@@ -175,6 +184,7 @@ class ScannerEngine:
         try:
             changed_groups.update(self._scan_folder(Path(folder)))
         except (OSError, ValueError) as exc:
+            self._scan_had_errors = True
             self.database.mark_folder(self.root_path, folder, "error", str(exc))
             self.on_status(f"Could not scan {folder}: {exc}")
         else:
@@ -264,6 +274,7 @@ class ScannerEngine:
             partial_groups[digest].append(current)
 
         if self._candidate_recheck_incomplete:
+            self._scan_had_errors = True
             return set()
 
         changed_groups: set[int] = set()
@@ -283,6 +294,7 @@ class ScannerEngine:
                 full_groups[digest].append(candidate)
 
             if self._candidate_recheck_incomplete:
+                self._scan_had_errors = True
                 return changed_groups
 
             for digest, full_matches in full_groups.items():

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import sqlite3
 import tempfile
 import time
@@ -12,6 +14,7 @@ from dupefinder.db import Database
 from dupefinder.review import (
     ReviewService,
     highlighted_path_html,
+    review_item_snapshot,
     timestamp_difference_flags,
 )
 from dupefinder.scanner import ScannerEngine
@@ -26,6 +29,11 @@ class MigrationTests(unittest.TestCase):
                     """
                     CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                     INSERT INTO settings(key, value) VALUES ('min_size_kb', '250');
+                    CREATE TABLE scan_roots (
+                        path TEXT PRIMARY KEY,
+                        min_size_bytes INTEGER NOT NULL,
+                        cycle_started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
                     CREATE TABLE duplicate_groups (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         root_path TEXT NOT NULL,
@@ -51,6 +59,10 @@ class MigrationTests(unittest.TestCase):
                     );
                     """
                 )
+                connection.execute(
+                    "INSERT INTO scan_roots(path, min_size_bytes) VALUES (?, ?)",
+                    (str(Path(temporary) / "legacy-scan"), 102400),
+                )
 
             database = Database(database_path)
 
@@ -63,7 +75,16 @@ class MigrationTests(unittest.TestCase):
                 version = connection.execute("PRAGMA user_version").fetchone()[0]
             self.assertIn("batch_id", columns)
             self.assertIn("review_key", columns)
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
+            with closing(sqlite3.connect(database_path)) as connection:
+                scan_root_columns = {
+                    row[1]
+                    for row in connection.execute("PRAGMA table_info(scan_roots)")
+                }
+            self.assertIn("results_valid", scan_root_columns)
+            self.assertFalse(
+                database.scan_results_valid(Path(temporary) / "legacy-scan")
+            )
 
 
 class DifferenceHelperTests(unittest.TestCase):
@@ -136,6 +157,54 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(items[0].kind, "folder")
             self.assertEqual(items[0].relation, "subset")
             self.assertEqual(items[0].file_count, 2)
+
+    def test_legacy_folder_fingerprint_is_migrated_before_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "scan"
+            now = time.time()
+            for folder in ("A", "B"):
+                self._write(root / folder / "one.bin", b"one" * 50_000, now)
+                self._write(root / folder / "two.bin", b"two" * 50_000, now)
+            database = Database(Path(temporary) / "state.db")
+            ScannerEngine(database, root, 100 * 1024).run()
+            item = ReviewService(database).list_inbox(root)[0]
+            legacy_payload = [
+                (
+                    mapping.group.id,
+                    mapping.relative_path.casefold(),
+                    tuple(
+                        (location.casefold(), path.casefold())
+                        for location, path in mapping.paths_by_location
+                    ),
+                    database.group_membership_fingerprint(mapping.group),
+                )
+                for mapping in item.mappings
+            ]
+            legacy_fingerprint = hashlib.sha256(
+                json.dumps(
+                    legacy_payload,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            database.ignore_review_item(
+                review_key=item.key,
+                root_path=item.root_path,
+                fingerprint=legacy_fingerprint,
+                kind=item.kind,
+                snapshot_json=review_item_snapshot(item),
+            )
+            database.clear_scan_results(root)
+            ScannerEngine(database, root, 100 * 1024).run()
+
+            reloaded = ReviewService(database)
+            ignored = reloaded.list_ignored(root)
+
+            self.assertEqual(len(ignored), 1)
+            self.assertEqual(
+                database.ignored_review_keys(root)[item.key],
+                item.fingerprint,
+            )
 
     def test_ignored_and_staged_items_return_when_membership_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

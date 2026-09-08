@@ -1,9 +1,40 @@
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
 .venv/
+venv/
+env/
+
+# Packaging and build output
 build/
 dist/
+*.egg-info/
 *.spec.bak
-.pytest_cache/
-.coverage
+
+# DupeFinder runtime data and caches
 data/
+unused-thumbs/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

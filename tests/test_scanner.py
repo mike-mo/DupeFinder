@@ -54,9 +54,11 @@ class ScannerTests(unittest.TestCase):
 
             result = ScannerEngine(database, root, 100 * 1024, should_stop=lambda: True).run()
             self.assertTrue(result.paused)
+            self.assertFalse(database.scan_results_valid(root))
 
             resumed = ScannerEngine(database, root, 100 * 1024).run()
             self.assertEqual(resumed.folders_completed, 1)
+            self.assertTrue(database.scan_results_valid(root))
 
     def test_scanning_starts_before_folder_discovery_finishes(self) -> None:
         class SlowDiscoveryScanner(ScannerEngine):
@@ -112,6 +114,7 @@ class ScannerTests(unittest.TestCase):
                 IncompleteDiscoveryScanner(database, root, 100 * 1024).run()
 
             self.assertEqual(len(database.list_duplicate_groups(root)), 1)
+            self.assertFalse(database.scan_results_valid(root))
 
     def test_transient_entry_error_preserves_cached_file_records(self) -> None:
         class Entry:

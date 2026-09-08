@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from dupefinder.db import Database
+from dupefinder.models import ReviewItem
 from dupefinder.review import ReviewService, human_size
 
 
@@ -34,6 +35,8 @@ class CartView(QWidget):
         self.database = database
         self.service = service
         self._commit_allowed = True
+        self.review_items: dict[str, ReviewItem] = {}
+        self.hidden_roots: set[str] = set()
 
         layout = QVBoxLayout(self)
         self.summary = QLabel()
@@ -58,9 +61,25 @@ class CartView(QWidget):
     def count(self) -> int:
         return self.tree.topLevelItemCount()
 
+    def set_review_items(self, items: tuple[ReviewItem, ...] | list[ReviewItem]) -> None:
+        self.review_items = {item.key: item for item in items}
+        self.refresh()
+
+    def hide_root(self, root_path: str) -> None:
+        self.hidden_roots.add(root_path.casefold())
+        self.refresh()
+
+    def unhide_root(self, root_path: str) -> None:
+        self.hidden_roots.discard(root_path.casefold())
+        self.refresh()
+
     def refresh(self) -> None:
         self.tree.clear()
-        batches = self.database.list_action_batches()
+        batches = [
+            batch
+            for batch in self.database.list_action_batches()
+            if batch.root_path.casefold() not in self.hidden_roots
+        ]
         ready_count = 0
         total_savings = 0
         for batch in batches:
@@ -78,7 +97,7 @@ class CartView(QWidget):
                 item.setToolTip(4, batch.last_error)
             self.tree.addTopLevelItem(item)
 
-            current_review = self.service.find_item(batch.root_path, batch.review_key)
+            current_review = self.review_items.get(batch.review_key)
             if current_review:
                 destination = QComboBox()
                 destination.addItems(current_review.locations)
@@ -152,7 +171,13 @@ class CartView(QWidget):
 
     def _ignore(self, batch_id: int) -> None:
         try:
-            self.service.move_batch_to_ignored(batch_id)
+            batch = self.database.get_action_batch(batch_id)
+            if not batch:
+                raise ValueError("Cart batch no longer exists")
+            item = self.review_items.get(batch.review_key)
+            if not item:
+                raise ValueError("The duplicate item changed and must be reviewed again")
+            self.service.ignore(item)
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "Could not ignore batch", str(exc))
             return

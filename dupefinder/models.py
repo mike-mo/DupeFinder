@@ -104,6 +104,20 @@ class ReviewItem:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewSnapshot:
+    request_id: int
+    root_path: str
+    current_items: tuple[ReviewItem, ...]
+    all_items: tuple[ReviewItem, ...]
+    inbox_items: tuple[ReviewItem, ...]
+    ignored_items: tuple[ReviewItem, ...]
+    ignored_saved_count: int
+    thumbnail_paths: tuple[tuple[str, str], ...]
+    reconciled: bool
+    reconciled_roots: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ActionBatch:
     id: int
     root_path: str

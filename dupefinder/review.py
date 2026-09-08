@@ -119,17 +119,16 @@ class ReviewService:
         else:
             self._cache.pop(normalize_path(root_path), None)
 
-    def list_all(self, root_path: str | Path) -> list[ReviewItem]:
+    def list_all(
+        self,
+        root_path: str | Path,
+        *,
+        reconcile: bool = True,
+    ) -> list[ReviewItem]:
         root = normalize_path(root_path)
         items = self._cache.get(root)
         if items is None:
             groups = self.database.list_duplicate_groups(root)
-            for group in groups:
-                self.database.update_group_membership_fingerprint(
-                    group.id,
-                    self.database.group_membership_fingerprint(group),
-                )
-
             bundles, bundled_group_ids = self._folder_bundles(root, groups)
             file_items = [
                 self._file_item(group)
@@ -139,17 +138,34 @@ class ReviewService:
             items = [*bundles, *file_items]
             items.sort(key=lambda item: (-item.savings, item.label.casefold(), item.key))
             self._cache[root] = items
-        self.database.reconcile_review_items(
-            root,
-            {item.key: item.fingerprint for item in items},
-        )
+        if reconcile and self.database.scan_results_valid(root):
+            self.database.reconcile_review_items(
+                root,
+                {item.key: item.fingerprint for item in items},
+            )
         return list(items)
 
-    def list_inbox(self, root_path: str | Path) -> list[ReviewItem]:
-        items = self.list_all(root_path)
+    def list_inbox(
+        self,
+        root_path: str | Path,
+        *,
+        reconcile: bool = True,
+    ) -> list[ReviewItem]:
+        items = self.list_all(root_path, reconcile=reconcile)
+        inbox, _ignored_items = self.partition_items(items, root_path)
+        return inbox
+
+    def partition_items(
+        self,
+        items: Sequence[ReviewItem],
+        root_path: str | Path,
+    ) -> tuple[list[ReviewItem], list[ReviewItem]]:
         ignored = self.database.ignored_review_keys(root_path)
         batches = self.database.active_review_batches(root_path)
-        return [
+        ignored_items = [
+            item for item in items if ignored.get(item.key) == item.fingerprint
+        ]
+        inbox = [
             item
             for item in items
             if ignored.get(item.key) != item.fingerprint
@@ -159,15 +175,31 @@ class ReviewService:
                 and batch.review_fingerprint == item.fingerprint
             )
         ]
+        return inbox, ignored_items
 
-    def list_ignored(self, root_path: str | Path) -> list[ReviewItem]:
-        items = self.list_all(root_path)
-        ignored = self.database.ignored_review_keys(root_path)
-        return [item for item in items if ignored.get(item.key) == item.fingerprint]
+    def list_ignored(
+        self,
+        root_path: str | Path,
+        *,
+        reconcile: bool = True,
+    ) -> list[ReviewItem]:
+        items = self.list_all(root_path, reconcile=reconcile)
+        _inbox, ignored = self.partition_items(items, root_path)
+        return ignored
 
-    def find_item(self, root_path: str | Path, review_key: str) -> ReviewItem | None:
+    def find_item(
+        self,
+        root_path: str | Path,
+        review_key: str,
+        *,
+        reconcile: bool = True,
+    ) -> ReviewItem | None:
         return next(
-            (item for item in self.list_all(root_path) if item.key == review_key),
+            (
+                item
+                for item in self.list_all(root_path, reconcile=reconcile)
+                if item.key == review_key
+            ),
             None,
         )
 
@@ -443,12 +475,13 @@ class ReviewService:
         key = f"folder:{hashlib.sha256(key_payload.encode('utf-8')).hexdigest()}"
         fingerprint_payload = [
             (
-                mapping.group.id,
                 mapping.relative_path.casefold(),
                 tuple(
                     (location.casefold(), path.casefold())
                     for location, path in mapping.paths_by_location
                 ),
+                mapping.group.size,
+                mapping.group.full_hash,
                 self.database.group_membership_fingerprint(mapping.group),
             )
             for mapping in mappings
@@ -460,6 +493,30 @@ class ReviewService:
                 ensure_ascii=True,
             ).encode("utf-8")
         ).hexdigest()
+        legacy_fingerprint_payload = [
+            (
+                mapping.group.id,
+                mapping.relative_path.casefold(),
+                tuple(
+                    (location.casefold(), path.casefold())
+                    for location, path in mapping.paths_by_location
+                ),
+                self.database.group_membership_fingerprint(mapping.group),
+            )
+            for mapping in mappings
+        ]
+        legacy_fingerprint = hashlib.sha256(
+            json.dumps(
+                legacy_fingerprint_payload,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        self.database.migrate_review_fingerprint(
+            key,
+            legacy_fingerprint,
+            fingerprint,
+        )
         relation_label = "Identical folders" if candidate.relation == "identical" else "Folder subset"
         return ReviewItem(
             key=key,
