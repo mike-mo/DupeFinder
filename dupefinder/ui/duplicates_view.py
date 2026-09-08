@@ -246,7 +246,7 @@ class FolderGroupRow(QWidget):
         icon_label.setFixedSize(30, 30)
         icon_label.setPixmap(
             QFileIconProvider()
-            .icon(QFileInfo(node.path))
+            .icon(QFileIconProvider.IconType.Folder)
             .pixmap(26, 26)
         )
         icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)

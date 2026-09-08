@@ -3,6 +3,8 @@
 DupeFinder is a Windows desktop app for finding byte-for-byte duplicate files and
 staging safe cleanup decisions before changing anything on disk.
 
+![DupeFinder scanning synthetic, redacted demo data](docs/dupefinder-screenshot.png)
+
 ## What it does
 
 - Recursively scans a folder chosen in the app.
